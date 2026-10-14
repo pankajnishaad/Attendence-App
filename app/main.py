@@ -16,6 +16,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
+from contextlib import asynccontextmanager
 
 load_dotenv()
 
@@ -24,7 +26,39 @@ db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+# app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    db.employees.create_index(
+        [("emp_code", 1)],
+        unique=True,
+        name="uniq_employee_emp_code"
+    )
+
+    db.employees.create_index(
+        [("department", 1)],
+        name="idx_employee_department"
+    )
+
+    db.attendance_logs.create_index(
+        [("emp_code", 1), ("date", 1)],
+        unique=True,
+        name="uniq_attendance_emp_date"
+    )
+
+    db.attendance_logs.create_index(
+        [("date", -1), ("emp_code", 1)],
+        name="idx_attendance_date_emp"
+    )
+
+    yield
+
+app = FastAPI(
+    title="Employee Attendance & Analytics API",
+    version="2.0.0",
+    lifespan=lifespan
+)
+
 
 
 # --------------------------------------------------------------------------- #
@@ -86,10 +120,22 @@ def health():
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
     if db.employees.find_one({"emp_code": body.emp_code}):
-        raise HTTPException(409, "emp_code already exists")
+        raise HTTPException(
+            status_code=409,
+            detail="emp_code already exists"
+        )
+
     doc = body.model_dump()
     doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
+
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(
+            status_code=409,
+            detail="emp_code already exists"
+        )
+
     doc.pop("_id", None)
     return doc
 
@@ -108,10 +154,30 @@ def list_employees(department: Optional[str] = None, page: int = 1, page_size: i
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
+
+    if not emp:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee not found"
+        )
+
+    ts = (
+        datetime.fromtimestamp(body.punched_at / 1000)
+        if body.punched_at
+        else datetime.now()
+    )
+
     d = ts.date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
+
+    if db.attendance_logs.find_one({
+        "emp_code": body.emp_code,
+        "date": d
+    }):
+        raise HTTPException(
+            status_code=409,
+            detail="already punched in for this date"
+        )
+
     doc = {
         "emp_code": body.emp_code,
         "date": d,
@@ -119,12 +185,22 @@ def punch_in(body: PunchInIn):
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": compute_late_minutes(
+            ts, emp["shift_start"]
+        ),
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
+
+    try:
+        res = db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(
+            status_code=409,
+            detail="already punched in for this date"
+        )
+
     doc["id"] = str(res.inserted_id)
     doc.pop("_id", None)
     return doc
