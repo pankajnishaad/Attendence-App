@@ -148,11 +148,11 @@ def compute_overtime(punch_out: datetime, shift_end: str, date_str: str, shift_s
 # --------------------------------------------------------------------------- #
 class EmployeeIn(BaseModel):
     emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
-    name: str
+    name: str = Field(min_length=1, max_length=100)
     email: EmailStr
-    department: str
-    shift_start: str = "09:30"
-    shift_end: str = "18:30"
+    department: str = Field(min_length=1, max_length=50)
+    shift_start: str = Field(default="09:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    shift_end: str = Field(default="18:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
     joined_on: date
     @model_validator(mode="after")
     def validate_shift_times(self):
@@ -1048,9 +1048,15 @@ def department_summary(
 
     departments = list(db.employees.aggregate(pipeline))
 
+    # Apply half-up rounding for avg_work_hours (2 decimals) per R8
+    for dept in departments:
+        if dept.get("avg_work_hours") is not None:
+            d = Decimal(str(dept["avg_work_hours"]))
+            dept["avg_work_hours"] = float(d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
     return {
         "month": month,
-        "departments": departments
+        "items": departments
     }
 
 
@@ -1179,12 +1185,23 @@ def department_trend(
     pipeline = [
         {
             "$match": {
-                "department": department,
                 "date": {
                     "$gte": from_date.isoformat(),
                     "$lte": to_date.isoformat()
                 }
             }
+        },
+        {
+            "$lookup": {
+                "from": "employees",
+                "localField": "emp_code",
+                "foreignField": "emp_code",
+                "as": "employee"
+            }
+        },
+        {"$unwind": "$employee"},
+        {
+            "$match": {"employee.department": department}
         },
         {
             "$addFields": {
@@ -1361,6 +1378,19 @@ def department_trend(
     ]
 
     items = list(db.attendance_logs.aggregate(pipeline))
+
+    # Apply half-up rounding for rates (4 decimals) per R8
+    def round_half_up_4(value):
+        if value is None:
+            return None
+        d = Decimal(str(value))
+        return float(d.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP))
+
+    for item in items:
+        if item.get("attendance_rate") is not None:
+            item["attendance_rate"] = round_half_up_4(item["attendance_rate"])
+        if item.get("moving_avg_7d") is not None:
+            item["moving_avg_7d"] = round_half_up_4(item["moving_avg_7d"])
 
     return {
         "department": department,
