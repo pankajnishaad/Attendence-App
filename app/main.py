@@ -9,12 +9,12 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from datetime import datetime, timedelta, timezone, date
+from typing import Optional, Literal
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field, model_validator, EmailStr, StrictInt
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 from contextlib import asynccontextmanager
@@ -25,6 +25,14 @@ client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
+def to_epoch_ms(dt: datetime | None) -> int | None:
+    if dt is None:
+        return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    return int(dt.timestamp() * 1000)
 
 # app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
 @asynccontextmanager
@@ -64,11 +72,29 @@ app = FastAPI(
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
-    h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    minutes = int((punch_in - start).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
+def compute_late_minutes(
+    punch_in_utc: datetime,
+    shift_start: str
+) -> int:
+    punch_in_ist = punch_in_utc.astimezone(IST)
+
+    hour, minute = map(int, shift_start.split(":"))
+
+    shift_start_ist = punch_in_ist.replace(
+        hour=hour,
+        minute=minute,
+        second=0,
+        microsecond=0
+    )
+
+    delta_seconds = int(
+        (punch_in_ist - shift_start_ist).total_seconds()
+    )
+
+    if delta_seconds <= 600:
+        return 0
+
+    return delta_seconds // 60
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
@@ -85,19 +111,33 @@ def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
 # Models
 # --------------------------------------------------------------------------- #
 class EmployeeIn(BaseModel):
-    emp_code: str
+    emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
     name: str
-    email: str
+    email: EmailStr
     department: str
     shift_start: str = "09:30"
     shift_end: str = "18:30"
-    joined_on: str
+    joined_on: date
+    @model_validator(mode="after")
+    def validate_shift_times(self):
+        if self.shift_start == self.shift_end:
+            raise ValueError("shift_start and shift_end must be different")
+        return self
 
 
 class PunchInIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = None
-    status: str = "PRESENT"
+    punched_at: Optional[StrictInt] = None
+    status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
+
+    @model_validator(mode="after")
+    def validate_punched_at(self):
+        if self.punched_at is not None:
+            if not 100000000000 <= self.punched_at <= 4102444800000:
+                raise ValueError(
+                    "punched_at must be epoch milliseconds in the allowed range"
+                )
+        return self
 
 
 # --------------------------------------------------------------------------- #
@@ -126,7 +166,10 @@ def create_employee(body: EmployeeIn):
         )
 
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
+    doc["joined_on"] = body.joined_on.isoformat()
+
+    created_at = datetime.now(timezone.utc).replace(microsecond=0)
+    doc["created_at"] = created_at
 
     try:
         db.employees.insert_one(doc)
@@ -137,18 +180,39 @@ def create_employee(body: EmployeeIn):
         )
 
     doc.pop("_id", None)
+    doc["created_at"] = to_epoch_ms(created_at)
+
     return doc
 
 
 @app.get("/employees")
-def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
+def list_employees(
+    department: Optional[str] = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
     q = {}
-    if department:
+
+    if department is not None:
         q["department"] = department
-    skip = page * page_size
-    total = db.employees.count_documents({})
-    items = list(db.employees.find(q, {"_id": 0}).skip(skip).limit(page_size))
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+    skip = (page - 1) * page_size
+
+    total = db.employees.count_documents(q)
+
+    items = list(
+        db.employees.find(q, {"_id": 0})
+        .sort("emp_code", 1)
+        .skip(skip)
+        .limit(page_size)
+    )
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
 
 
 @app.post("/attendance/punch-in", status_code=201)
@@ -161,13 +225,38 @@ def punch_in(body: PunchInIn):
             detail="Employee not found"
         )
 
-    ts = (
-        datetime.fromtimestamp(body.punched_at / 1000)
-        if body.punched_at
-        else datetime.now()
-    )
+    if body.punched_at is not None:
+        ts_utc = datetime.fromtimestamp(
+            body.punched_at / 1000,
+            tz=timezone.utc
+        )
+    else:
+        ts_utc = datetime.now(timezone.utc)
 
-    d = ts.date().isoformat()
+    # Truncate timestamp to whole seconds
+    ts_utc = ts_utc.replace(microsecond=0)
+
+    # Convert UTC instant to IST
+    ts_ist = ts_utc.astimezone(IST)
+
+    shift_start = emp["shift_start"]
+    shift_end = emp["shift_end"]
+
+    # Calculate attendance date
+    if shift_end <= shift_start:
+        hour_end, minute_end = map(int, shift_end.split(":"))
+
+        punch_minutes = ts_ist.hour * 60 + ts_ist.minute
+        end_minutes = hour_end * 60 + minute_end
+
+        if punch_minutes < end_minutes:
+            attendance_date = ts_ist.date() - timedelta(days=1)
+        else:
+            attendance_date = ts_ist.date()
+    else:
+        attendance_date = ts_ist.date()
+
+    d = attendance_date.isoformat()
 
     if db.attendance_logs.find_one({
         "emp_code": body.emp_code,
@@ -182,11 +271,11 @@ def punch_in(body: PunchInIn):
         "emp_code": body.emp_code,
         "date": d,
         "status": body.status,
-        "punch_in": ts,
+        "punch_in": ts_utc,
         "punch_out": None,
         "work_hours": None,
         "late_minutes": compute_late_minutes(
-            ts, emp["shift_start"]
+            ts_utc, shift_start
         ),
         "overtime_minutes": 0,
         "half_day": False,
@@ -203,8 +292,9 @@ def punch_in(body: PunchInIn):
 
     doc["id"] = str(res.inserted_id)
     doc.pop("_id", None)
-    return doc
+    doc["punch_in"] = to_epoch_ms(ts_utc)
 
+    return doc
 
 @app.get("/attendance")
 def list_attendance(
